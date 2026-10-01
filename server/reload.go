@@ -2323,7 +2323,13 @@ func (s *Server) reloadAuthorization() {
 		for _, se := range acc.exports.services {
 			se.clearResponseThresholdTimer()
 		}
+		// Release any connection blocked on the account's egress quota.
+		limiter := acc.egressLimiter
+		acc.egressLimiter = nil
 		acc.mu.Unlock()
+		if limiter != nil {
+			limiter.Close()
+		}
 		acc.removeAllServiceImportSubs()
 	}
 

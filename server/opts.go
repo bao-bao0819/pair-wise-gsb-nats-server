@@ -3582,6 +3582,64 @@ func parseAccountMappings(v any, acc *Account, errors *[]error) error {
 	return nil
 }
 
+// parseEgressBytesPerSecond parses an account egress bandwidth value.
+// Accepted forms are a plain number of bytes per second (1048576), or a
+// human size with an optional binary/decimal unit and optional "/s" suffix:
+// "1MB", "512kbps" is not accepted (rate is bytes/sec), "256K/s",
+// "1mib/s", "1000000". Whitespace and a trailing "/s" are ignored.
+func parseEgressBytesPerSecond(v any) (int64, error) {
+	s, ok := v.(string)
+	if !ok {
+		n, ok := v.(int64)
+		if !ok {
+			return 0, fmt.Errorf("egress rate should be a number or size string, got %T", v)
+		}
+		if n < 0 {
+			return 0, fmt.Errorf("egress rate cannot be negative: %d", n)
+		}
+		return n, nil
+	}
+
+	orig := s
+	s = strings.TrimSpace(s)
+	s = strings.TrimSuffix(s, "/s")
+	s = strings.TrimSuffix(s, "/S")
+	s = strings.TrimSpace(s)
+	s = strings.ToLower(s)
+
+	var mult int64 = 1
+	for _, suf := range []struct {
+		s string
+		m int64
+	}{
+		{"gib", 1 << 30},
+		{"mib", 1 << 20},
+		{"kib", 1 << 10},
+		{"gb", 1 << 30},
+		{"mb", 1 << 20},
+		{"kb", 1 << 10},
+		{"g", 1 << 30},
+		{"m", 1 << 20},
+		{"k", 1 << 10},
+		{"b", 1},
+	} {
+		if strings.HasSuffix(s, suf.s) {
+			s = strings.TrimSpace(strings.TrimSuffix(s, suf.s))
+			mult = suf.m
+			break
+		}
+	}
+
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid egress rate %q", orig)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("egress rate cannot be negative: %q", orig)
+	}
+	return n * mult, nil
+}
+
 // parseAccountLimits is called to parse account limits in a server config.
 func parseAccountLimits(mv any, acc *Account, errors *[]error) error {
 	var lt token
@@ -3604,6 +3662,12 @@ func parseAccountLimits(mv any, acc *Account, errors *[]error) error {
 			acc.mpay = int32(mv.(int64))
 		case "max_leafnodes", "max_leafs":
 			acc.mleafs = int32(mv.(int64))
+		case "max_egress_rate", "max_egress", "egress_rate":
+			bps, err := parseEgressBytesPerSecond(mv)
+			if err != nil {
+				return &configErr{tk, err.Error()}
+			}
+			acc.egress = bps
 		default:
 			if !tk.IsUsedVariable() {
 				err := &configErr{tk, fmt.Sprintf("Unknown field %q parsing account limits", k)}

@@ -6028,12 +6028,12 @@ func (c *client) mqttEnqueuePublishMsgTo(cc *client, sub *subscription, pi uint1
 	cc.mu.Lock()
 	if sub.mqtt.prm != nil {
 		for _, data := range sub.mqtt.prm {
-			cc.queueOutbound(data)
+			cc.queueOutbound(data, false)
 		}
 		sub.mqtt.prm = nil
 	}
-	cc.queueOutbound(headerBytes)
-	cc.queueOutbound(msg)
+	cc.queueOutbound(headerBytes, false)
+	cc.queueOutbound(msg, false)
 	c.addToPCD(cc)
 	trace := cc.trace
 	cc.mu.Unlock()
@@ -6358,7 +6358,7 @@ func (c *client) mqttSendRetainedMsgsToNewSubs(subs []*subscription) {
 	for _, sub := range subs {
 		if sub.mqtt != nil && sub.mqtt.prm != nil {
 			for _, data := range sub.mqtt.prm {
-				c.queueOutbound(data)
+				c.queueOutbound(data, false)
 			}
 			sub.mqtt.prm = nil
 		}

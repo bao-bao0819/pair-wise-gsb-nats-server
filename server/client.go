@@ -281,6 +281,7 @@ type client struct {
 	ncsAcc     atomic.Value
 	ncsUser    atomic.Value
 	out        outbound
+	closedCh   chan struct{} // Closed under c.mu once the connection is marked closed; used to abort egress waits.
 	user       *NkeyUser
 	host       string
 	port       uint16
@@ -350,6 +351,7 @@ type outbound struct {
 	nb  net.Buffers        // Pending buffers for send, each has fixed capacity as per nbPool below.
 	wnb net.Buffers        // Working copy of "nb", reused on each flushOutbound call, partial writes may leave entries here for next iteration.
 	pb  int64              // Total pending/queued bytes.
+	pcb int64              // Of pb, bytes that are protocol control frames eligible for the account's priority lane.
 	fsp int32              // Flush signals that are pending per producer from readLoop's pcd.
 	wtp WriteTimeoutPolicy // What do we do on a write timeout?
 	sg  *sync.Cond         // To signal writeLoop that there is data to flush.
@@ -422,6 +424,42 @@ func nbPoolPut(b []byte) {
 		// Ignore frames that are the wrong size, this might happen
 		// with WebSocket/MQTT messages as they are framed
 	}
+}
+
+// trimBuffersToBudget splits bufs into a head covering at most budget
+// bytes and the remaining tail. A buffer straddling the boundary is split,
+// preserving byte order for later reassembly. The caller is responsible for
+// re-queuing the tail on the next flush.
+func trimBuffersToBudget(bufs net.Buffers, budget int64) (head, tail net.Buffers) {
+	if budget <= 0 {
+		return nil, bufs
+	}
+	remaining := budget
+	for i, b := range bufs {
+		if int64(len(b)) <= remaining {
+			remaining -= int64(len(b))
+			continue
+		}
+		head = append(net.Buffers(nil), bufs[:i]...)
+		// Copy both slices of the boundary buffer: the head and tail slices
+		// would otherwise alias a shared pooled array, which would corrupt
+		// nbPoolPut's size invariants. Head keeps a private copy so it is
+		// recycled (as a regular unpooled buffer) independently of the
+		// original frame (which we return to the pool now); tail bytes are
+		// copied into a new pooled frame.
+		nbPoolPut(b)
+		h := make([]byte, int(remaining))
+		copy(h, b[:remaining])
+		head = append(head, h)
+		rest := b[remaining:]
+		tb := nbPoolGet(len(rest))
+		tb = tb[:len(rest)]
+		copy(tb, rest)
+		tail = append(net.Buffers{}, tb)
+		tail = append(tail, bufs[i+1:]...)
+		return head, tail
+	}
+	return bufs, nil
 }
 
 type perm struct {
@@ -1850,17 +1888,17 @@ func (c *client) flushOutbound() bool {
 		attempted = int64(len(collapsed[0]))
 	}
 
+	// Bytes carried over from a previous partial write were charged against
+	// the account quota on an earlier flush; they must not be billed twice.
+	carryN := int64(0)
+	for _, buf := range c.out.wnb {
+		carryN += int64(len(buf))
+	}
+
 	// This is safe to do outside of the lock since "collapsed" is no longer
 	// referenced in c.out.nb (which can be modified in queueOutbound() while
 	// the lock is released).
 	c.out.wnb = append(c.out.wnb, collapsed...)
-	var _orig [nbMaxVectorSize][]byte
-	orig := append(_orig[:0], c.out.wnb...)
-
-	// Since WriteTo is lopping things off the beginning, we need to remember
-	// the start position of the underlying array so that we can get back to it.
-	// Otherwise we'll always "slide forward" and that will result in reallocs.
-	startOfWnb := c.out.wnb[0:]
 
 	// flush here
 	start := time.Now()
@@ -1868,6 +1906,71 @@ func (c *client) flushOutbound() bool {
 	var n int64   // Total bytes written
 	var wn int64  // Bytes written per loop
 	var err error // Error from last write, if any
+
+	// Account-level aggregate egress shaping. The limiter is shared by
+	// every connection of the account, so the ceiling covers the account's
+	// real combined output rather than a per-connection allowance. Only new
+	// bytes are billed (carryN was billed before); one turn
+	// (<= egressMaxGrant) is written per flush, so active connections keep
+	// taking fair turns and the remainder is flushed next time. Control
+	// frames at the front of the queue may use the bounded priority lane.
+	var turn egressTurn
+	var gated bool
+	var budget int64 = carryN
+	// requeued holds new bytes not covered by this turn's quota. They go
+	// back onto c.out.nb to be collapsed and billed on a later flush.
+	var requeued net.Buffers
+
+	newN := int64(0)
+	for _, buf := range collapsed {
+		newN += int64(len(buf))
+	}
+
+	// The IO section above runs without the client lock. acquireEgressQuota
+	// acquires it, releases it while blocked, and returns holding it.
+	ctrl := c.out.pcb
+	if cw != nil {
+		ctrl = 0
+	}
+	turn, gotTurn := c.acquireEgressQuota(newN, ctrl)
+	// Do NOT bail out when the connection is already closed: this flush is
+	// the final drain from flushAndClose and must still deliver pending
+	// protocol frames (e.g. -ERR). gotTurn is true for an unlimited account
+	// and when a blocked limiter was released by the close.
+	if !gotTurn {
+		return true
+	}
+	// Actual writes below must not hold the client lock.
+	c.mu.Unlock()
+	if turn.l != nil {
+		gated = true
+		billedNew := turn.dataN + turn.ctrlN
+		budget = carryN + billedNew
+	}
+
+	// Split the appended vectors into the bytes covered by this turn
+	// (existing carry plus the billed portion of the new bytes) and the
+	// unbilled remainder. The remainder must go back onto c.out.nb so it is
+	// collapsed and billed on a later flush instead of being mistaken for
+	// already-paid carry.
+	if gated {
+		var head, rest net.Buffers
+		head, rest = trimBuffersToBudget(c.out.wnb, budget)
+		c.out.wnb = head
+		requeued = rest
+	}
+
+	// Snapshot the vectors actually attempted this flush, only after the
+	// limiter trim, so pooled buffers can be recycled correctly.
+	var _orig [nbMaxVectorSize][]byte
+	orig := append(_orig[:0], c.out.wnb...)
+	// Since WriteTo is lopping things off the beginning, we need to remember
+	// the start position of the underlying array so that we can get back to it.
+	// Otherwise we'll always "slide forward" and that will result in reallocs.
+	var startOfWnb net.Buffers
+	if len(c.out.wnb) > 0 {
+		startOfWnb = c.out.wnb[0:]
+	}
 	for len(c.out.wnb) > 0 {
 		// Limit the number of vectors to no more than nbMaxVectorSize,
 		// which if 1024, will mean a maximum of 64MB in one go.
@@ -1940,6 +2043,15 @@ func (c *client) flushOutbound() bool {
 	// so leave them alone for the next call to flushOutbound.
 	c.out.wnb = append(startOfWnb[:0], c.out.wnb...)
 
+	// Unbilled bytes trimmed off by egress shaping go back onto the front of
+	// c.out.nb so they are collapsed, billed, and sent on a later flush in
+	// the correct order. Billed bytes left by a partial write remain in wnb.
+	if gated {
+		if len(requeued) > 0 {
+			c.out.nb = append(requeued, c.out.nb...)
+		}
+	}
+
 	// If we've written everything but the underlying array of our working
 	// buffer has grown excessively then free it — the GC will tidy it up
 	// and we can allocate a new one next time.
@@ -1976,6 +2088,13 @@ func (c *client) flushOutbound() bool {
 	c.out.pb -= n
 	if c.isWebsocket() {
 		c.ws.fs -= n
+	}
+	// Control frames are consumed from the front of the outbound queue,
+	// matching the order bytes are written, so deduct written control bytes
+	// from the pending control count too.
+	if c.out.pcb > 0 {
+		consumedCtrl := min(c.out.pcb, n)
+		c.out.pcb -= consumedCtrl
 	}
 
 	// Check that if there is still data to send and writeLoop is in wait,
@@ -2096,6 +2215,8 @@ func (c *client) markConnAsClosed(reason ClosedState) {
 		return
 	}
 	c.flags.set(connMarkedClosed)
+	// Release any write path blocked on an account egress quota wait.
+	c.signalClosedLocked()
 	// For a websocket client, unless we are told not to flush, enqueue
 	// a websocket CloseMessage based on the reason.
 	if !skipFlush && c.isWebsocket() && !c.ws.closeSent {
@@ -2620,9 +2741,136 @@ func (c *client) maxPayloadViolation(sz int, max int32) {
 	c.closeConnection(MaxPayloadExceeded)
 }
 
-// queueOutbound queues data for a clientconnection.
+// closedNotifyChan returns a channel that is closed when the connection is
+// marked closed. It is lazily allocated under c.mu by the write path so
+// that connections which never block on an egress quota pay nothing.
+func (c *client) closedNotifyChan() chan struct{} {
+	if c.closedCh == nil {
+		c.closedCh = make(chan struct{})
+	}
+	return c.closedCh
+}
+
+// closedNotifyChanLocked is the caller-holds-c.mu variant.
+func (c *client) closedNotifyChanLocked() chan struct{} {
+	return c.closedNotifyChan()
+}
+
+// signalClosedLocked closes the notification channel, unblocking an
+// account egress quota wait. c.mu must be held.
+func (c *client) signalClosedLocked() {
+	if c.closedCh != nil {
+		close(c.closedCh)
+	}
+}
+
+// accountEgressLimiter returns the limiter that applies to this
+// connection's outbound bytes, or nil if the account has no aggregate
+// egress limit. Only regular client connections are shaped; system, route,
+// gateway and leaf connections are not (the aggregate limit is scoped to
+// the account's own clients).
+func (c *client) accountEgressLimiter() *accountEgressLimiter {
+	if c.kind != CLIENT || c.acc == nil {
+		return nil
+	}
+	c.acc.mu.RLock()
+	l := c.acc.getEgressLimiterLocked()
+	c.acc.mu.RUnlock()
+	return l
+}
+
+// egressTurn describes one charged write turn.
+type egressTurn struct {
+	l     *accountEgressLimiter
+	dataN int64 // bytes charged to the shared data quota
+	ctrlN int64 // bytes charged to the priority control lane
+}
+
+// acquireEgressQuota blocks until a turn worth of the account's aggregate
+// egress quota is available for the pending bytes. The client lock must NOT
+// be held on entry; it is acquired here and released while waiting.
+// Control frames are first charged to the bounded priority lane; the
+// remainder goes through the shared data quota used by every connection of
+// the account.
+//
+// The client lock must not be held on entry (the IO section just released
+// it); this function acquires it and returns holding it. ok=false means the
+// wait was aborted (limiter replaced by a config update) without charging;
+// the caller should stop this flush and retry. A connection that is already
+// closed drains non-blocking with whatever quota is immediately available.
+func (c *client) acquireEgressQuota(pending, control int64) (egressTurn, bool) {
+	c.mu.Lock()
+	l := c.accountEgressLimiter()
+	if l == nil {
+		return egressTurn{}, true
+	}
+
+	// A connection that is already closed is doing its final drain. Never
+	// queue it behind active connections; send whatever data and control
+	// quota is immediately available so queued -ERR/-INFO frames can still
+	// go out promptly during teardown.
+	if c.isClosed() {
+		ctrlN := l.tryAcquireControl(control)
+		dataN := l.tryAcquireData(pending - ctrlN)
+		return egressTurn{l: l, dataN: dataN, ctrlN: ctrlN}, true
+	}
+
+	ch := c.closedNotifyChanLocked()
+	c.mu.Unlock()
+
+	// Opportunistic, non-blocking charge to the priority control lane. What
+	// it cannot absorb falls onto the shared data quota, so the lane cannot
+	// be turned into an unlimited bypass.
+	ctrlN := l.tryAcquireControl(control)
+	dataNeed := pending - ctrlN
+	var n int64
+	if dataNeed > 0 {
+		n = l.Acquire(ch, min(dataNeed, egressMaxGrant))
+	}
+	c.mu.Lock()
+	if dataNeed > 0 && n <= 0 {
+		if ctrlN > 0 {
+			l.refund(ctrlN, true)
+		}
+		return egressTurn{}, false
+	}
+	return egressTurn{l: l, dataN: n, ctrlN: ctrlN}, true
+}
+
+// refund returns charged bytes that were not actually written (partial
+// writes, write errors, compressed output) so accounting stays honest and
+// the ceiling only ever covers real output bytes.
+func (t egressTurn) refund(unwrittenData, unwrittenCtrl int64) {
+	l := t.l
+	if l == nil {
+		return
+	}
+	if unwrittenCtrl > 0 {
+		l.refund(unwrittenCtrl, true)
+	}
+	if unwrittenData > 0 {
+		l.refund(unwrittenData, false)
+	}
+}
+
+func (l *accountEgressLimiter) refund(n int64, control bool) {
+	if n <= 0 {
+		return
+	}
+	l.mu.Lock()
+	if control {
+		l.ctrlTokens = min(egressControlBurst, l.ctrlTokens+float64(n))
+	} else {
+		l.tokens = min(l.burst, l.tokens+float64(n))
+	}
+	l.mu.Unlock()
+}
+
+// queueOutbound queues data for a client connection. ctrl marks protocol
+// control frames (PING/PONG, INFO, -ERR, OK, ...) which are eligible for
+// the account egress limiter's bounded priority lane.
 // Lock should be held.
-func (c *client) queueOutbound(data []byte) {
+func (c *client) queueOutbound(data []byte, ctrl bool) {
 	// Do not keep going if closed
 	if c.isClosed() {
 		return
@@ -2630,6 +2878,9 @@ func (c *client) queueOutbound(data []byte) {
 
 	// Add to pending bytes total.
 	c.out.pb += int64(len(data))
+	if ctrl {
+		c.out.pcb += int64(len(data))
+	}
 
 	// Take a copy of the slice ref so that we can chop bits off the beginning
 	// without affecting the original "data" slice.
@@ -2694,7 +2945,7 @@ func (c *client) enqueueProtoAndFlush(proto []byte, doFlush bool) {
 	if c.isClosed() {
 		return
 	}
-	c.queueOutbound(proto)
+	c.queueOutbound(proto, true)
 	if !(doFlush && c.flushOutbound()) {
 		c.flushSignal()
 	}
@@ -4072,11 +4323,11 @@ func (c *client) deliverMsg(prodIsMQTT bool, sub *subscription, acc *Account, su
 	}
 
 	// Queue to outbound buffer
-	client.queueOutbound(mh)
-	client.queueOutbound(msg)
+	client.queueOutbound(mh, false)
+	client.queueOutbound(msg, false)
 	if prodIsMQTT {
 		// Need to add CR_LF since MQTT producers don't send CR_LF
-		client.queueOutbound([]byte(CR_LF))
+		client.queueOutbound([]byte(CR_LF), false)
 	}
 
 	// If we are tracking dynamic publish permissions that track reply subjects,
@@ -4593,7 +4844,7 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 			if sub := c.subForReply(c.pa.reply); sub != nil {
 				hdrLen := 32 /* header without the subject */ + len(c.pa.subject)
 				proto := fmt.Sprintf("HMSG %s %s %d %d\r\nNATS/1.0 503\r\nNats-Subject: %s\r\n\r\n\r\n", c.pa.reply, sub.sid, hdrLen, hdrLen, c.pa.subject)
-				c.queueOutbound([]byte(proto))
+				c.queueOutbound([]byte(proto), false)
 				c.addToPCD(c)
 			}
 		}

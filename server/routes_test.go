@@ -4758,7 +4758,7 @@ func TestRouteNoAppSubLeakOnSlowConsumer(t *testing.T) {
 		c := s1.getClient(cid)
 		payload := make([]byte, 2048)
 		c.mu.Lock()
-		c.queueOutbound([]byte(fmt.Sprintf("MSG foo 1 2048\r\n%s\r\n", payload)))
+		c.queueOutbound([]byte(fmt.Sprintf("MSG foo 1 2048\r\n%s\r\n", payload)), false)
 		closed := c.isClosed()
 		c.mu.Unlock()
 

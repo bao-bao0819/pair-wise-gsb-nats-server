@@ -1730,7 +1730,7 @@ func TestClientOutboundQueueCoalesce(t *testing.T) {
 	defer client.mu.Unlock()
 
 	// First up, queue something small into the queue.
-	client.queueOutbound([]byte{1, 2, 3, 4, 5})
+	client.queueOutbound([]byte{1, 2, 3, 4, 5}, false)
 
 	if len(client.out.nb) != 1 {
 		t.Fatal("Expecting a single queued buffer")
@@ -1741,7 +1741,7 @@ func TestClientOutboundQueueCoalesce(t *testing.T) {
 
 	// Then queue up a few more bytes, but not enough
 	// to overflow into the next buffer.
-	client.queueOutbound([]byte{6, 7, 8, 9, 10})
+	client.queueOutbound([]byte{6, 7, 8, 9, 10}, false)
 
 	if len(client.out.nb) != 1 {
 		t.Fatal("Expecting a single queued buffer")
@@ -1754,7 +1754,7 @@ func TestClientOutboundQueueCoalesce(t *testing.T) {
 	// to overflow.
 	b := nbPoolSmall.Get().(*[nbPoolSizeSmall]byte)[:]
 	b = b[:cap(b)]
-	client.queueOutbound(b)
+	client.queueOutbound(b, false)
 	if len(client.out.nb) != 2 {
 		t.Fatal("Expecting buffer to have overflowed")
 	}
@@ -2550,7 +2550,7 @@ func TestPBNotIncreasedOnMaxPending(t *testing.T) {
 	c.initClient()
 
 	c.mu.Lock()
-	c.queueOutbound(make([]byte, 200))
+	c.queueOutbound(make([]byte, 200), false)
 	pb := c.out.pb
 	c.mu.Unlock()
 
@@ -2599,7 +2599,7 @@ func TestFlushOutboundNoSliceReuseIfPartial(t *testing.T) {
 	for _, buf := range bufs {
 		expected.Write(buf)
 		c.mu.Lock()
-		c.queueOutbound(buf)
+		c.queueOutbound(buf, false)
 		c.flushOutbound()
 		fakeConn.partial = false
 		c.mu.Unlock()
@@ -2637,7 +2637,7 @@ func TestFlushOutboundFreesExcessiveWorkingBuffer(t *testing.T) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		for i := 0; i < n; i++ {
-			c.queueOutbound(payload)
+			c.queueOutbound(payload, false)
 		}
 		if len(c.out.nb) != n {
 			t.Fatalf("Expected %d queued buffers, got %d", n, len(c.out.nb))
@@ -2711,7 +2711,7 @@ func TestFlushOutboundPartialWriteKeepsPoolBufferCapacity(t *testing.T) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.queueOutbound(payload)
+	c.queueOutbound(payload, false)
 	c.flushOutbound()
 
 	// The write timed out after maxWrite bytes, so the rest of the buffer
@@ -4689,7 +4689,7 @@ func TestFlushOutboundS2CompressionPartialWritePendingBytes(t *testing.T) {
 
 			c.mu.Lock()
 			defer c.mu.Unlock()
-			c.queueOutbound(payload)
+			c.queueOutbound(payload, false)
 			c.flushOutbound()
 
 			// A partial timeout must keep the connection open and retain the
@@ -4707,7 +4707,7 @@ func TestFlushOutboundS2CompressionPartialWritePendingBytes(t *testing.T) {
 			// the leftover compressed bytes were subtracted a second time.
 			if queueMore {
 				more := []byte("PING\r\n")
-				c.queueOutbound(more)
+				c.queueOutbound(more, false)
 				expected = append(expected, more...)
 			}
 			fakeConn.maxWrite = 0
@@ -4751,7 +4751,7 @@ func TestFlushOutboundS2CompressionPoolBufferRecycling(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		c.mu.Lock()
 		for j := 0; j < numBuffers; j++ {
-			c.queueOutbound(payload)
+			c.queueOutbound(payload, false)
 		}
 		c.flushOutbound()
 		c.mu.Unlock()
@@ -4760,7 +4760,7 @@ func TestFlushOutboundS2CompressionPoolBufferRecycling(t *testing.T) {
 	allocs := testing.AllocsPerRun(100, func() {
 		c.mu.Lock()
 		for j := 0; j < numBuffers; j++ {
-			c.queueOutbound(payload)
+			c.queueOutbound(payload, false)
 		}
 		c.flushOutbound()
 		c.mu.Unlock()

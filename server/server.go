@@ -1292,7 +1292,9 @@ func (s *Server) configureAccounts(reloading bool) (map[string]struct{}, error) 
 				// We call shallowCopy from the account `acc` (the one in Options)
 				// and pass `a` (our existing account) to get it updated.
 				acc.shallowCopy(a)
+				egress := a.egress
 				a.mu.Unlock()
+				a.SetEgressLimit(egress)
 				create = false
 			}
 		}
@@ -1310,7 +1312,9 @@ func (s *Server) configureAccounts(reloading bool) (map[string]struct{}, error) 
 			// Locking matters in the case of an update of the global account
 			a.mu.Lock()
 			acc.shallowCopy(a)
+			egress := a.egress
 			a.mu.Unlock()
+			a.SetEgressLimit(egress)
 			// Will be a no-op in case of the global account since it is already registered.
 			s.registerAccountNoLock(a)
 		}

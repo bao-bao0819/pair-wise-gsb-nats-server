@@ -93,20 +93,21 @@ type Account struct {
 	jsLimits     map[string]JetStreamAccountLimits
 	nrgAccount   string
 	limits
-	expired      atomic.Bool
-	incomplete   bool
-	signingKeys  map[string]jwt.Scope
-	extAuth      *jwt.ExternalAuthorization
-	srv          *Server // server this account is registered with (possibly nil)
-	lds          string  // loop detection subject for leaf nodes
-	siReply      []byte  // service reply prefix, will form wildcard subscription.
-	eventIds     *nuid.NUID
-	eventIdsMu   sync.Mutex
-	defaultPerms *Permissions
-	tags         jwt.TagList
-	nameTag      string
-	lastLimErr   int64
-	routePoolIdx int
+	egressLimiter *accountEgressLimiter // process-local aggregate outbound bandwidth limit; nil means unlimited
+	expired       atomic.Bool
+	incomplete    bool
+	signingKeys   map[string]jwt.Scope
+	extAuth       *jwt.ExternalAuthorization
+	srv           *Server // server this account is registered with (possibly nil)
+	lds           string  // loop detection subject for leaf nodes
+	siReply       []byte  // service reply prefix, will form wildcard subscription.
+	eventIds      *nuid.NUID
+	eventIdsMu    sync.Mutex
+	defaultPerms  *Permissions
+	tags          jwt.TagList
+	nameTag       string
+	lastLimErr    int64
+	routePoolIdx  int
 	// If the trace destination is specified and a message with a traceParentHdr
 	// is received, and has the least significant bit of the last token set to 1,
 	// then if traceDestSampling is > 0 and < 100, a random value will be selected
@@ -129,6 +130,7 @@ type limits struct {
 	msubs          int32
 	mconns         int32
 	mleafs         int32
+	egress         int64 // aggregate outbound bandwidth in bytes/sec, 0 means unlimited
 	disallowBearer bool
 }
 
@@ -369,10 +371,44 @@ func (im *importMap) removeRespEntry(reply, msub string) {
 func NewAccount(name string) *Account {
 	a := &Account{
 		Name:     name,
-		limits:   limits{-1, -1, -1, -1, false},
+		limits:   limits{mpay: -1, msubs: -1, mconns: -1, mleafs: -1},
 		eventIds: nuid.New(),
 	}
 	return a
+}
+
+// egressLimiterLocked returns the active aggregate egress limiter, or nil
+// if none is configured. Account read lock must be held (or access be
+// otherwise serialized).
+func (a *Account) getEgressLimiterLocked() *accountEgressLimiter {
+	return a.egressLimiter
+}
+
+// SetEgressLimit configures the process-local aggregate outbound bandwidth
+// ceiling for the account, in bytes per second. A value of 0 removes the
+// limit. Any connection currently blocked on the previous limit is
+// released: it either picks up the new limiter on retry or proceeds
+// uncapped if the limit was removed.
+func (a *Account) SetEgressLimit(bps int64) {
+	a.mu.Lock()
+	if a.egress == bps && ((bps == 0) == (a.egressLimiter == nil)) {
+		// Unchanged across a reload: keep the existing bucket and its
+		// accrued tokens so reloads neither reset the shaper nor release
+		// waiters.
+		a.mu.Unlock()
+		return
+	}
+	old := a.egressLimiter
+	a.egress = bps
+	if bps > 0 {
+		a.egressLimiter = newAccountEgressLimiter(bps)
+	} else {
+		a.egressLimiter = nil
+	}
+	a.mu.Unlock()
+	if old != nil {
+		old.Close()
+	}
 }
 
 func (a *Account) String() string {
