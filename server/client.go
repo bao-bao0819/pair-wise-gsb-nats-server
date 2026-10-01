@@ -358,6 +358,7 @@ type outbound struct {
 	lft time.Duration      // Last flush time for Write.
 	stc chan struct{}      // Stall chan we create to slow down producers on overrun, e.g. fan-in.
 	cw  *s2.Writer
+	eac chan struct{} // Closed once when the connection is closed; aborts account egress waits.
 }
 
 const nbMaxVectorSize = 1024 // == IOV_MAX on Linux/Darwin and most other Unices (except Solaris/AIX)
@@ -726,6 +727,7 @@ func (c *client) initClient() {
 
 	// Outbound data structure setup
 	c.out.sg = sync.NewCond(&c.mu)
+	c.out.eac = make(chan struct{})
 	opts := s.getOpts()
 	// Snapshots to avoid mutex access in fast paths.
 	c.out.wdl = opts.WriteDeadline
@@ -1799,6 +1801,17 @@ func (c *client) flushOutbound() bool {
 	// of the client's lock, which is interesting in case of compression.
 	c.out.nb = nil
 
+	// Account aggregate egress limiting applies only to local client/leaf
+	// egress. When enabled, the write loop reserves bounded chunks from the
+	// shared account bucket before emitting bytes; a chunk that starts with a
+	// small protocol control frame (PING/PONG/OK/-ERR) uses the limiter's
+	// priority lane while still being charged against the shared bucket.
+	var egressL *accountEgressLimiter
+	if c.acc != nil && (c.kind == CLIENT || c.kind == LEAF) {
+		egressL = c.acc.egressLimiter()
+	}
+	egressLimited := !egressL.unlimited()
+
 	// In case it goes away after releasing the lock.
 	nc := c.nc
 
@@ -1865,15 +1878,88 @@ func (c *client) flushOutbound() bool {
 	// flush here
 	start := time.Now()
 
-	var n int64   // Total bytes written
-	var wn int64  // Bytes written per loop
-	var err error // Error from last write, if any
+	var n int64          // Total bytes written
+	var wn int64         // Bytes written per loop
+	var err error        // Error from last write, if any
+	egressDefer := false // inline flush unable to wait: defer to writeLoop
+	var reservedTotal int64
 	for len(c.out.wnb) > 0 {
+		// Account egress gating. Reserve one bounded chunk from the shared
+		// account bucket before writing. This caps aggregate emitted bytes
+		// (each chunk is reserved up front) and bounds how much a single
+		// connection consumes per turn, letting other active connections share
+		// the account fairly. If the chunk starts with a small protocol
+		// control frame (PING/PONG/OK/-ERR), it uses the priority lane, which
+		// remains timely but is still charged against the shared bucket.
+		var writeBufs net.Buffers
+		if egressLimited {
+			pending := bufsLen(c.out.wnb)
+			want := int64(aelMaxChunk)
+			if want > pending {
+				want = pending
+			}
+			ctrlWant := leadingControlBytes(c.out.wnb, want)
+			dataWant := want - ctrlWant
+			canBlock := c.flags.isSet(writeLoopStarted)
+			acquire := func(nn int64, ctrl bool) bool {
+				if nn == 0 {
+					return true
+				}
+				if canBlock {
+					return egressL.reserve(int(nn), ctrl, c.out.eac)
+				}
+				return false
+			}
+			gotCtrl := acquire(ctrlWant, true)
+			if gotCtrl && acquire(dataWant, false) {
+				reservedTotal += want
+				writeBufs = splitBufsHead(c.out.wnb, want)
+			} else {
+				if gotCtrl && ctrlWant > 0 {
+					egressL.refund(int(ctrlWant))
+					reservedTotal -= ctrlWant
+				}
+				// Either the connection is being torn down (eac closed) or the
+				// limiter was replaced/removed by a configuration update.
+				select {
+				case <-c.out.eac:
+					// Close/slow-consumer: stop emitting. The writeLoop sees
+					// the closed connection on its next iteration and runs the
+					// close path; remaining bytes stay in wnb.
+				default:
+					if canBlock {
+						// The limiter was stopped (egress limit removed or the
+						// account object replaced by a reload). Re-read the
+						// current limiter: if limiting is gone, continue
+						// ungated; a newly configured limiter is rare here and
+						// we simply retry the gated loop.
+						if c.acc != nil {
+							egressL = c.acc.egressLimiter()
+							if egressL.unlimited() {
+								egressLimited = false
+								continue
+							}
+						}
+						c.mu.Unlock()
+						time.Sleep(aelPacerInterval)
+						c.mu.Lock()
+						continue
+					}
+					// Inline flush from a producer readLoop: never block.
+					egressDefer = true
+				}
+				break
+			}
+		}
+
 		// Limit the number of vectors to no more than nbMaxVectorSize,
 		// which if 1024, will mean a maximum of 64MB in one go.
-		wnb := c.out.wnb
-		if len(wnb) > nbMaxVectorSize {
-			wnb = wnb[:nbMaxVectorSize]
+		wnb := writeBufs
+		if wnb == nil {
+			wnb = c.out.wnb
+			if len(wnb) > nbMaxVectorSize {
+				wnb = wnb[:nbMaxVectorSize]
+			}
 		}
 		consumed := len(wnb)
 
@@ -1886,7 +1972,14 @@ func (c *client) flushOutbound() bool {
 		// Update accounting, move wnb slice onwards if needed, or stop
 		// if a write error was reported that wasn't a short write.
 		n += wn
-		c.out.wnb = c.out.wnb[consumed-len(wnb):]
+		if egressLimited {
+			// Drop exactly the bytes this socket write accepted from the
+			// front of the full working buffer. Any reserved-but-unwritten
+			// bytes are refunded to the account bucket below.
+			c.out.wnb = dropFrontBufs(c.out.wnb, wn)
+		} else {
+			c.out.wnb = c.out.wnb[consumed-len(wnb):]
+		}
 		if err != nil && err != io.ErrShortWrite {
 			break
 		}
@@ -1900,6 +1993,20 @@ func (c *client) flushOutbound() bool {
 
 	// Re-acquire client lock.
 	c.mu.Lock()
+
+	// Account egress accounting: return any allowance reserved but not
+	// emitted (partial/aborted writes or deferred inline flushes). Bytes that
+	// remain in wnb stay queued (still counted in pb) and will be reserved
+	// again on the next flush, but the reservations from this flush are
+	// released so the account bucket is not held by bytes that did not move.
+	if egressLimited && reservedTotal > n {
+		egressL.refund(int(reservedTotal - n))
+	}
+	if egressDefer {
+		// Hand the remainder back to the writeLoop so it can block on the
+		// account bucket without stalling this producer's readLoop.
+		c.flushSignal()
+	}
 
 	// Adjust if we were compressing.
 	if cw != nil {
@@ -2096,6 +2203,15 @@ func (c *client) markConnAsClosed(reason ClosedState) {
 		return
 	}
 	c.flags.set(connMarkedClosed)
+	// Release any account-egress wait held by our writeLoop immediately, no
+	// matter which teardown path marked the connection closed. Idempotent.
+	if c.out.eac != nil {
+		select {
+		case <-c.out.eac:
+		default:
+			close(c.out.eac)
+		}
+	}
 	// For a websocket client, unless we are told not to flush, enqueue
 	// a websocket CloseMessage based on the reason.
 	if !skipFlush && c.isWebsocket() && !c.ws.closeSent {

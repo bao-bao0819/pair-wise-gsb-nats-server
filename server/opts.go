@@ -3604,6 +3604,13 @@ func parseAccountLimits(mv any, acc *Account, errors *[]error) error {
 			acc.mpay = int32(mv.(int64))
 		case "max_leafnodes", "max_leafs":
 			acc.mleafs = int32(mv.(int64))
+		case "max_egress", "max_egress_bandwidth":
+			bps, err := parseByteRate(mv, tk)
+			if err != nil {
+				*errors = append(*errors, err)
+				continue
+			}
+			acc.egressBps = bps
 		default:
 			if !tk.IsUsedVariable() {
 				err := &configErr{tk, fmt.Sprintf("Unknown field %q parsing account limits", k)}
@@ -3613,6 +3620,61 @@ func parseAccountLimits(mv any, acc *Account, errors *[]error) error {
 	}
 
 	return nil
+}
+
+// parseByteRate parses an egress byte-rate value. It accepts a plain integer
+// (bytes/sec) or a string with an optional binary/decimal size suffix such as
+// "1KB", "512K", "1Mb" or "2g" (case-insensitive). Rates express a ceiling per
+// second of egress bytes.
+func parseByteRate(v any, tk token) (int64, error) {
+	switch n := v.(type) {
+	case int64:
+		return n, nil
+	case int:
+		return int64(n), nil
+	case string:
+		s := strings.TrimSpace(n)
+		if s == "" {
+			return 0, &configErr{tk, "Empty egress rate value"}
+		}
+		mult := int64(1)
+		last := s[len(s)-1]
+		switch {
+		case last == 'b' || last == 'B':
+			if len(s) < 2 {
+				return 0, &configErr{tk, fmt.Sprintf("Invalid egress rate value %q", n)}
+			}
+			unit := s[len(s)-2]
+			s = s[:len(s)-2]
+			switch unit {
+			case 'k', 'K':
+				mult = 1024
+			case 'm', 'M':
+				mult = 1024 * 1024
+			case 'g', 'G':
+				mult = 1024 * 1024 * 1024
+			default:
+				// Trailing 'b'/'B' without a size unit prefix is not a rate.
+				return 0, &configErr{tk, fmt.Sprintf("Invalid egress rate value %q", n)}
+			}
+		case last == 'k', last == 'K':
+			s = s[:len(s)-1]
+			mult = 1024
+		case last == 'm', last == 'M':
+			s = s[:len(s)-1]
+			mult = 1024 * 1024
+		case last == 'g', last == 'G':
+			s = s[:len(s)-1]
+			mult = 1024 * 1024 * 1024
+		}
+		val, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+		if err != nil || val < 0 {
+			return 0, &configErr{tk, fmt.Sprintf("Invalid egress rate value %q", n)}
+		}
+		return val * mult, nil
+	default:
+		return 0, &configErr{tk, fmt.Sprintf("Invalid egress rate value type %T", v)}
+	}
 }
 
 func parseAccountMsgTrace(mv any, topKey string, acc *Account) error {

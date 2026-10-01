@@ -116,6 +116,10 @@ type Account struct {
 	// Guarantee that only one goroutine can be running either checkJetStreamMigrate
 	// or clearObserverState at a given time for this account to prevent interleaving.
 	jscmMu sync.Mutex
+
+	// egressMu guards egress (the aggregate per-account outbound limiter).
+	egressMu sync.Mutex
+	egress   *accountEgressLimiter
 }
 
 const (
@@ -130,6 +134,11 @@ type limits struct {
 	mconns         int32
 	mleafs         int32
 	disallowBearer bool
+	// egressBps, when > 0, is the aggregate outbound byte rate (bytes/sec)
+	// shared by all local client/leaf connections of this account within this
+	// server process. <= 0 means unlimited. This is a server config limit only
+	// (not carried by JWT claims) and is intentionally not cluster-global.
+	egressBps int64
 }
 
 // Used to track remote clients and leafnodes per remote server.
@@ -368,8 +377,13 @@ func (im *importMap) removeRespEntry(reply, msub string) {
 // NewAccount creates a new unlimited account with the given name.
 func NewAccount(name string) *Account {
 	a := &Account{
-		Name:     name,
-		limits:   limits{-1, -1, -1, -1, false},
+		Name: name,
+		limits: limits{
+			mpay:   -1,
+			msubs:  -1,
+			mconns: -1,
+			mleafs: -1,
+		},
 		eventIds: nuid.New(),
 	}
 	return a
@@ -377,6 +391,49 @@ func NewAccount(name string) *Account {
 
 func (a *Account) String() string {
 	return a.Name
+}
+
+// egressLimiter returns the account's aggregate outbound limiter, lazily
+// creating it from the configured egressBps. Returns nil when account egress
+// limiting is disabled. Safe for concurrent use.
+func (a *Account) egressLimiter() *accountEgressLimiter {
+	a.egressMu.Lock()
+	l := a.egress
+	if l == nil && a.egressBps > 0 {
+		l = newAccountEgressLimiter(a.egressBps)
+		a.egress = l
+	}
+	a.egressMu.Unlock()
+	return l
+}
+
+// configureEgress applies an account egress ceiling, expressed in bytes per
+// second. A non-positive rate disables limiting. Current waiters are released
+// so they re-evaluate immediately against the new ceiling.
+func (a *Account) configureEgress(bps int64) {
+	a.egressMu.Lock()
+	defer a.egressMu.Unlock()
+	a.egressBps = bps
+	if bps <= 0 {
+		if a.egress != nil {
+			a.egress.stop()
+			a.egress = nil
+		}
+		return
+	}
+	if a.egress == nil {
+		a.egress = newAccountEgressLimiter(bps)
+	} else {
+		a.egress.update(bps)
+	}
+}
+
+// egressStats exposes a point-in-time snapshot of the account limiter.
+func (a *Account) egressStat() egressStats {
+	a.egressMu.Lock()
+	l := a.egress
+	a.egressMu.Unlock()
+	return l.stats()
 }
 
 func (a *Account) setTraceDest(dest string) {
@@ -451,6 +508,10 @@ func (a *Account) shallowCopy(na *Account) {
 	na.jsLimits = a.jsLimits
 	// Server config account limits.
 	na.limits = a.limits
+	// Apply the (possibly changed) aggregate egress ceiling to the live
+	// account. For a freshly created account this only records the setting;
+	// the limiter itself is created lazily on first use.
+	na.configureEgress(a.egressBps)
 }
 
 // nextEventID uses its own lock for better concurrency.
@@ -4522,6 +4583,9 @@ func removeCb(s *Server, pubKey string) {
 	a.updated = time.Now()
 	jsa := a.js
 	a.mu.Unlock()
+	// Remove the aggregate egress ceiling and release any blocked waiters;
+	// all of its clients are about to be disconnected.
+	a.configureEgress(0)
 	// set the account to be expired and disconnect clients
 	a.expiredTimeout()
 	// For JS, we need also to disable it.
